@@ -12,6 +12,45 @@ partitioning becomes worth its migration cost.
 > figures below are a **model** derived from the column types and the observed
 > event shapes — run the harness for real numbers before choosing any design.
 
+## Continuous benchmarking (CI)
+
+`.github/workflows/bench-events.yml` runs `npm run bench:events` daily and on
+any pull request that touches `src/indexer/`, `src/db/schema.sql`, or
+`src/db/migrations/`, against a throwaway Postgres service container. Results
+(raw JSON and a comparison table) land in that run's job summary, so a
+reviewer sees them without downloading an artifact.
+
+The run is compared against a committed baseline,
+[`docs/events-storage-baseline.json`](events-storage-baseline.json), by
+`scripts/check-bench-regression.ts`. A regression beyond threshold (bytes/row
+or the GIN index size growing >15–20%, fold throughput dropping by more than
+2x) is surfaced as a `::warning::` annotation and a highlighted job-summary
+banner — it does **not** fail the build. Shared GitHub-hosted runners are
+noisy enough, especially on wall-clock timing, that a hard failure would
+block unrelated PRs on false positives; a loud warning gets it in front of a
+reviewer instead. Update the baseline (re-run the bench at the same scale and
+commit the new `docs/events-storage-baseline.json`) as a deliberate step
+whenever a change intentionally moves these numbers.
+
+The baseline is measured, not modeled — 20,000 events, real Postgres 16:
+
+| metric | value |
+|---|---|
+| bytes/row (`pg_total_relation_size / count(*)`) | 578 |
+| `events_data_gin_idx` size | 2.6 MB |
+| `events_pkey` size | 984 kB |
+| `events_symbol_idx` size | 176 kB |
+| `events_entity_id_idx` size | 328 kB |
+| `events_contract_id_idx` size | 160 kB |
+| `reindexFromEventLog` throughput | ~1.0 ms/event (~1,000 events/s) |
+| distinct symbols / contract_ids in the seed mix | 16 / 2 |
+
+This one measured point is consistent with the row-size model below (~578 vs.
+a modeled ~420–720 bytes/row) and sits well inside modeled reindex throughput.
+It does not replace the 1M-row model — that scale is out of budget for a
+per-PR CI job — but it's now a real, continuously-checked data point rather
+than an estimate nobody re-runs.
+
 ## Row-size model
 
 Per `events` row (`src/db/schema.sql`):

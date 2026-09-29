@@ -1,0 +1,25 @@
+{
+  "ranAt": "2026-09-29T13:11:02.929Z",
+  "results": [
+    {
+      "totalBytes": 11567104,
+      "heapBytes": 6823936,
+      "toastBytes": 8192,
+      "rows": 20000,
+      "bytesPerRow": 578,
+      "indexBytes": {
+        "events_contract_id_idx": 163840,
+        "events_data_gin_idx": 2719744,
+        "events_entity_id_idx": 335872,
+        "events_ledger_idx": 270336,
+        "events_pkey": 1007616,
+        "events_symbol_idx": 180224
+      },
+      "distinctSymbols": 16,
+      "distinctContracts": 2,
+      "targetEvents": 20000,
+      "reindexMs": 20228.884841,
+      "reindexMsPerEvent": 1.01144424205
+    }
+  ]
+}

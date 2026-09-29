@@ -1,0 +1,109 @@
+name: Events storage benchmark
+
+# Issue #200 — scripts/bench-events-storage.ts existed but nothing in CI ever
+# ran it, so a change that doubled per-event storage or halved fold
+# throughput passed CI cleanly. `events` is append-only and grows forever,
+# and the fold (reindexFromEventLog) is the indexer's hot path — these are
+# exactly the regressions worth catching early.
+#
+# Runs on: a daily schedule (catches drift with no code change, e.g. a
+# Postgres version bump), and on PRs that touch the indexer, schema, or
+# migrations (catches it at the source). Separate workflow from ci.yml so a
+# benchmark hiccup never blocks the required build-and-test / docker-build
+# checks.
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/indexer/**'
+      - 'src/db/schema.sql'
+      - 'src/db/migrations/**'
+      - 'scripts/bench-events-storage.ts'
+      - 'scripts/check-bench-regression.ts'
+      - 'docs/events-storage-baseline.json'
+      - '.github/workflows/bench-events.yml'
+  workflow_dispatch:
+    inputs:
+      scale:
+        description: 'Event count to seed (matches the committed baseline scale unless overridden)'
+        required: false
+        default: '20000'
+
+concurrency:
+  group: bench-events-${{ github.event_name == 'pull_request' && github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ourdao
+          POSTGRES_PASSWORD: ourdao
+          POSTGRES_DB: ourdao_bench
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ourdao"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgres://ourdao:ourdao@localhost:5432/ourdao_bench
+      # Matches docs/events-storage-baseline.json — keep these in lockstep or
+      # the regression check has nothing to compare against (it warns and
+      # skips the comparison for a scale with no baseline entry rather than
+      # failing, see scripts/check-bench-regression.ts).
+      BENCH_SCALE: ${{ github.event.inputs.scale || '20000' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Apply schema.sql to the throwaway benchmark database
+        run: psql "$DATABASE_URL" -f src/db/schema.sql
+
+      - name: Run bench:events
+        run: BENCH_JSON_OUT=bench-results.json npm run bench:events -- "$BENCH_SCALE"
+
+      - name: Publish raw results to the job summary
+        if: always()
+        run: |
+          if [ -f bench-results.json ]; then
+            {
+              echo '### Raw bench:events output'
+              echo ''
+              echo '```json'
+              cat bench-results.json
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Compare against docs/events-storage-baseline.json
+        if: always()
+        run: |
+          if [ -f bench-results.json ]; then
+            npx tsx scripts/check-bench-regression.ts bench-results.json docs/events-storage-baseline.json
+          fi
+
+      - name: Upload full results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: events-storage-bench-${{ github.run_id }}
+          path: bench-results.json
+          retention-days: 90

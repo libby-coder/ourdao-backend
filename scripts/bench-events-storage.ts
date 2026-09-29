@@ -15,8 +15,13 @@
  *
  * Numbers land in docs/events-storage.md. Re-run when the schema, the event
  * catalog, or the reindex path changes.
+ *
+ * Set BENCH_JSON_OUT=<path> to also write a machine-readable JSON array of
+ * per-scale results (issue #200 — this is what CI parses to build the job
+ * summary and check for regressions against docs/events-storage-baseline.json).
  */
 import { randomUUID } from 'node:crypto'
+import { writeFileSync } from 'node:fs'
 import { pool } from '../src/db/index.js'
 import { reindexFromEventLog } from '../src/indexer/reindex.js'
 import { DERIVED_TABLES } from '../src/indexer/derived-tables.js'
@@ -111,41 +116,86 @@ async function seed(target: number, batch = 2000): Promise<void> {
   }
 }
 
-async function reportSizes(): Promise<void> {
-  const { rows: [heap] } = await pool.query<{ rel: string; total: string; heap: string; toast: string; rows: string }>(
-    `SELECT 'events' AS rel,
-            pg_size_pretty(pg_total_relation_size('events')) AS total,
-            pg_size_pretty(pg_relation_size('events')) AS heap,
-            pg_size_pretty(COALESCE(pg_total_relation_size(reltoastrelid), 0)) AS toast,
-            (SELECT count(*)::text FROM events) AS rows
+// pg_size_pretty is nice for a human reading the log, but issue #200's CI
+// regression check needs raw byte counts to do arithmetic on — so this
+// queries bytes directly and formats them the same way for console output,
+// rather than parsing pg_size_pretty's text back apart.
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} bytes`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} kB`
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`
+}
+
+interface SizeReport {
+  totalBytes: number
+  heapBytes: number
+  toastBytes: number
+  rows: number
+  bytesPerRow: number
+  indexBytes: Record<string, number>
+  distinctSymbols: number
+  distinctContracts: number
+}
+
+async function reportSizes(): Promise<SizeReport> {
+  const { rows: [heap] } = await pool.query<{ total_bytes: number; heap_bytes: number; toast_bytes: number; rows: number }>(
+    `SELECT pg_total_relation_size('events') AS total_bytes,
+            pg_relation_size('events') AS heap_bytes,
+            COALESCE(pg_total_relation_size(reltoastrelid), 0) AS toast_bytes,
+            (SELECT count(*) FROM events) AS rows
        FROM pg_class WHERE relname = 'events'`
   )
-  console.log(`  events: total=${heap.total} heap=${heap.heap} toast=${heap.toast} rows=${heap.rows}`)
-  const { rows: [avg] } = await pool.query<{ avg: string }>(
-    `SELECT pg_size_pretty((pg_total_relation_size('events') / GREATEST(count(*),1)))::text AS avg FROM events`
+  const bytesPerRow = heap.rows > 0 ? Math.round(heap.total_bytes / heap.rows) : 0
+  console.log(
+    `  events: total=${formatBytes(heap.total_bytes)} heap=${formatBytes(heap.heap_bytes)} ` +
+      `toast=${formatBytes(heap.toast_bytes)} rows=${heap.rows}`
   )
-  console.log(`  bytes/row (incl. indexes + toast): ${avg.avg}`)
+  console.log(`  bytes/row (incl. indexes + toast): ${bytesPerRow}`)
 
-  const idx = await pool.query<{ indexname: string; size: string }>(
-    `SELECT indexname, pg_size_pretty(pg_relation_size(indexname::regclass)) AS size
+  const idx = await pool.query<{ indexname: string; bytes: number }>(
+    `SELECT indexname, pg_relation_size(indexname::regclass) AS bytes
        FROM pg_indexes WHERE tablename = 'events' ORDER BY indexname`
   )
-  for (const r of idx.rows) console.log(`  index ${r.indexname}: ${r.size}`)
+  const indexBytes: Record<string, number> = {}
+  for (const r of idx.rows) {
+    indexBytes[r.indexname] = r.bytes
+    console.log(`  index ${r.indexname}: ${formatBytes(r.bytes)}`)
+  }
 
-  const sel = await pool.query<{ symbol_card: string; contract_card: string }>(
+  const sel = await pool.query<{ symbol_card: number; contract_card: number }>(
     `SELECT
-       (SELECT count(DISTINCT symbol)::text FROM events) AS symbol_card,
-       (SELECT count(DISTINCT contract_id)::text FROM events) AS contract_card`
+       (SELECT count(DISTINCT symbol) FROM events) AS symbol_card,
+       (SELECT count(DISTINCT contract_id) FROM events) AS contract_card`
   )
+  const { symbol_card: distinctSymbols, contract_card: distinctContracts } = sel.rows[0]!
   console.log(
-    `  distinct symbols=${sel.rows[0]!.symbol_card}, distinct contract_ids=${sel.rows[0]!.contract_card} ` +
+    `  distinct symbols=${distinctSymbols}, distinct contract_ids=${distinctContracts} ` +
       `(events_contract_id_idx selectivity — see docs/events-storage.md)`
   )
+
+  return {
+    totalBytes: heap.total_bytes,
+    heapBytes: heap.heap_bytes,
+    toastBytes: heap.toast_bytes,
+    rows: heap.rows,
+    bytesPerRow,
+    indexBytes,
+    distinctSymbols,
+    distinctContracts,
+  }
+}
+
+interface BenchResult extends SizeReport {
+  targetEvents: number
+  reindexMs: number
+  reindexMsPerEvent: number
 }
 
 async function main(): Promise<void> {
   const scales = (process.argv.slice(2).map(Number).filter((n) => n > 0))
   const targets = scales.length ? scales : [10_000, 100_000, 1_000_000]
+  const results: BenchResult[] = []
 
   await pool.query(`TRUNCATE ${['events', ...DERIVED_TABLES].join(', ')} RESTART IDENTITY CASCADE`)
   await pool.query(
@@ -160,12 +210,21 @@ async function main(): Promise<void> {
     await pool.query('VACUUM ANALYZE events')
 
     console.log(`\n=== ${target.toLocaleString()} events ===`)
-    await reportSizes()
+    const sizes = await reportSizes()
 
     const t0 = performance.now()
     const { events } = await reindexFromEventLog()
-    const ms = performance.now() - t0
-    console.log(`  reindexFromEventLog: ${(ms / 1000).toFixed(1)}s for ${events.toLocaleString()} events (${(ms / target).toFixed(2)} ms/event)`)
+    const reindexMs = performance.now() - t0
+    const reindexMsPerEvent = reindexMs / target
+    console.log(`  reindexFromEventLog: ${(reindexMs / 1000).toFixed(1)}s for ${events.toLocaleString()} events (${reindexMsPerEvent.toFixed(2)} ms/event)`)
+
+    results.push({ ...sizes, targetEvents: target, reindexMs, reindexMsPerEvent })
+  }
+
+  const jsonOut = process.env.BENCH_JSON_OUT
+  if (jsonOut) {
+    writeFileSync(jsonOut, JSON.stringify({ ranAt: new Date().toISOString(), results }, null, 2))
+    console.log(`\nWrote JSON results to ${jsonOut}`)
   }
 
   await pool.end()
